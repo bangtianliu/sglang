@@ -1,6 +1,8 @@
 """CPU contracts of the monokernel registry, checks, routing, coverage and copies."""
 
 import inspect
+import subprocess
+import sys
 import unittest
 from functools import partial
 from types import SimpleNamespace
@@ -85,6 +87,12 @@ SPEC = MonoSpec(
     load_tensor=_load_tensor,
 )
 OLD_SPEC = replace(SPEC, api_version=registry.MONOKERNEL_API_VERSION - 1)
+ISA_SPEC = replace(
+    SPEC,
+    devices={"gfx1250": DeviceLimits(widths=(8,), tp_sizes=(8,), resident_blocks=1)},
+)
+MODEL_SPEC = replace(ISA_SPEC, name="model_fallback")
+ISA_MODEL_SPEC = replace(ISA_SPEC, name="isa_model")
 # a DSpark draft at 2 draft tokens with anchor sampling: 1-token blocks
 ONE_TOKEN_DRAFT = replace(SPEC, tokens_per_request=lambda model: 1)
 
@@ -166,6 +174,53 @@ class TestMonokernelFramework(CustomTestCase):
         self.addCleanup(registry_patch.stop)
         registry.register(backend=BACKEND, architecture=ARCH, path=f"{__name__}:SPEC")
 
+    def test_builtin_discovery_is_lazy_and_needs_no_external_plugin(self):
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import sys; from sglang.kernels.plugin_kernels.amd import spec; "
+                "before = set(sys.modules); "
+                "assert spec.spec_registered(backend='amd', "
+                "architectures=['MuseSparkForConditionalGeneration']); "
+                "spec.register_builtin_specs(); "
+                "assert 'sglang.srt.kernel_plugins.amd.muse_spark.spec' "
+                "not in sys.modules; "
+                "assert not any(n.startswith(('torch', 'triton', 'sglang.srt')) "
+                "for n in set(sys.modules) - before); "
+                "assert 'sgl_amd_mono' not in sys.modules",
+            ],
+            check=True,
+        )
+
+    def test_builtin_and_external_registration_order_preserves_gfx950(self):
+        architecture = "MuseSparkForConditionalGeneration"
+        for builtin_first in (False, True):
+            with (
+                self.subTest(builtin_first=builtin_first),
+                patch.dict(registry._REGISTRY, clear=True),
+            ):
+                if builtin_first:
+                    registry.register_builtin_specs()
+                registry.register(
+                    backend=BACKEND,
+                    architecture=architecture,
+                    path=f"{__name__}:SPEC",
+                )
+                self.assertTrue(
+                    registry.spec_registered(
+                        backend=BACKEND,
+                        architectures=[architecture],
+                    )
+                )
+                found, reason = registry.find_spec(
+                    backend=BACKEND,
+                    architectures=[architecture],
+                    isa="gfx950",
+                )
+                self.assertIs(found, SPEC)
+                self.assertEqual(reason, "")
+
     def test_find_spec_refuses_with_a_reason(self):
         register = partial(registry.register, backend=BACKEND)
         register(architecture="Broken", path="no_such_module:SPEC")
@@ -199,6 +254,82 @@ class TestMonokernelFramework(CustomTestCase):
         self.assertIs(
             registry.find_spec(backend=BACKEND, architectures=[ARCH], isa="gfx950")[0],
             SPEC,
+        )
+
+    def test_isa_registration_coexists_with_an_architecture_fallback(self):
+        registry.register(
+            backend=BACKEND,
+            architecture=ARCH,
+            isa="gfx1250",
+            path=f"{__name__}:ISA_SPEC",
+        )
+        for isa, expected in (("gfx950", SPEC), ("gfx1250", ISA_SPEC)):
+            with self.subTest(isa=isa):
+                found, reason = registry.find_spec(
+                    backend=BACKEND,
+                    architectures=[ARCH],
+                    isa=isa,
+                )
+                self.assertIs(found, expected)
+                self.assertEqual(reason, "")
+        with self.assertRaises(ValueError):
+            registry.register(
+                backend=BACKEND,
+                architecture=ARCH,
+                isa="gfx1250",
+                path="other:SPEC",
+            )
+
+    def test_isa_and_model_type_lookup_precedence(self):
+        for model_type, isa, name in (
+            ("typed", None, "MODEL_SPEC"),
+            (None, "gfx1250", "ISA_SPEC"),
+            ("typed", "gfx1250", "ISA_MODEL_SPEC"),
+        ):
+            registry.register(
+                backend=BACKEND,
+                architecture=ARCH,
+                model_type=model_type,
+                isa=isa,
+                path=f"{__name__}:{name}",
+            )
+        for key, expected in (
+            (None, ISA_MODEL_SPEC),
+            ((ARCH, "typed", "gfx1250"), ISA_SPEC),
+            ((ARCH, None, "gfx1250"), MODEL_SPEC),
+        ):
+            if key is not None:
+                registry._REGISTRY[BACKEND].pop(key)
+            found, reason = registry.find_spec(
+                backend=BACKEND,
+                architectures=[ARCH],
+                model_type="typed",
+                isa="gfx1250",
+            )
+            self.assertIs(found, expected)
+            self.assertEqual(reason, "")
+
+    def test_spec_registered_recognizes_isa_only_entries(self):
+        registry.register(
+            backend=BACKEND,
+            architecture="IsaOnly",
+            isa="gfx1250",
+            model_type="typed",
+            path=f"{__name__}:ISA_SPEC",
+        )
+        self.assertTrue(
+            registry.spec_registered(
+                backend=BACKEND,
+                architectures=["IsaOnly"],
+                model_type="typed",
+            )
+        )
+        self.assertFalse(
+            registry.spec_registered(
+                backend=BACKEND,
+                architectures=["IsaOnly"],
+                model_type="other",
+            )
         )
 
     def test_features_in_use_are_refused_unless_accepted(self):
@@ -475,7 +606,7 @@ class TestMonokernelFramework(CustomTestCase):
                 self.assertEqual(binding._backend(), backend)
                 reset_context()
         with patch.dict(
-            registry._REGISTRY, {binding.MSA_BACKEND: {(ARCH, None): "x:y"}}
+            registry._REGISTRY, {binding.MSA_BACKEND: {(ARCH, None, None): "x:y"}}
         ):
             self.assertTrue(binding.msa_serves([ARCH]))
             self.assertFalse(binding.msa_serves(["OtherForCausalLM"]))
@@ -493,6 +624,41 @@ class TestMonokernelFramework(CustomTestCase):
         self.assertEqual(deadline_s(None), MAX_DEADLINE_S)
         self.assertEqual(deadline_s(3600), MAX_DEADLINE_S)
         self.assertEqual(deadline_s(30), 15.0)
+
+
+class TestScratchPlan(CustomTestCase):
+    def test_regions_isolate_parity_and_ranks(self):
+        """Padding, parity or region overlap would corrupt another rank's live mailbox."""
+        from sglang.kernels.plugin_kernels.amd.muse_spark.gfx1250.framework.plan import (
+            RegionRequest,
+            make_plan,
+        )
+
+        plan = make_plan(
+            8,
+            (
+                RegionRequest("payload", 33),
+                RegionRequest("flag", 1),
+                RegionRequest("local", 3, False),
+            ),
+        )
+        occupied = set()
+        for region in plan.regions:
+            for rank in range(8):
+                for parity in range(region.copies):
+                    offset = region.offset(rank, parity)
+                    self.assertEqual(offset % 32, 0)
+                    extent = set(range(offset, offset + region.words))
+                    self.assertTrue(occupied.isdisjoint(extent))
+                    occupied.update(extent)
+                    self.assertLessEqual(max(extent), plan.total_words - 1)
+                self.assertEqual(region.offset(rank, 0), region.offset(rank, 2))
+        peer = plan.region("payload")
+        self.assertNotEqual(peer.offset(0, 0), peer.offset(0, 1))
+        local = plan.region("local")
+        self.assertEqual(local.offset(0, 0), local.offset(0, 1))
+        with self.assertRaises(ValueError):
+            make_plan(8, (RegionRequest("same", 1), RegionRequest("same", 2)))
 
 
 if __name__ == "__main__":

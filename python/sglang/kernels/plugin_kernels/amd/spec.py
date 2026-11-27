@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Lazy plugin registration and model-specific monokernel contracts."""
+"""Lazy monokernel contracts, registered by architecture, model type and ISA.
+
+ISA-specific paths take precedence over architecture-only plugin registrations.
+"""
 
 from __future__ import annotations
 
@@ -170,34 +173,56 @@ class MonoSpec(msgspec.Struct, frozen=True):
         return self.devices[isa].widths
 
 
-# backend name -> (HF architecture, model type or None) -> the "module:attribute"
+# backend name -> (HF architecture, model type or None, ISA or None) -> the "module:attribute"
 # path of its spec
-_REGISTRY: dict[str, dict[tuple[str, Optional[str]], str]] = {}
+_REGISTRY: dict[str, dict[tuple[str, Optional[str], Optional[str]], str]] = {}
 
 
 def register(
-    *, backend: str, architecture: str, path: str, model_type: Optional[str] = None
+    *,
+    backend: str,
+    architecture: str,
+    path: str,
+    model_type: Optional[str] = None,
+    isa: Optional[str] = None,
 ) -> None:
     """Register a module:attribute spec path from a general plugin entry point. A
     spec registered with a ``model_type`` serves only configs of that model type, and
     is looked up before one registered for the architecture alone: models that share
-    an architecture (DeepSeek-V4 and V4.1) can each have their own."""
+    an architecture (DeepSeek-V4 and V4.1) can each have their own. An optional ISA
+    selects a device-specific path before either architecture-only fallback."""
     specs = _REGISTRY.setdefault(backend, {})
-    key = (architecture, model_type)
+    key = (architecture, model_type, isa)
     if specs.get(key, path) != path:
         of = architecture if model_type is None else f"{architecture} ({model_type})"
         raise ValueError(
-            f"monokernel backend {backend!r} already has a spec for {of}: {specs[key]}"
+            f"monokernel backend {backend!r} already has a spec for {of} "
+            f"on {isa or 'any ISA'}: {specs[key]}"
         )
     specs[key] = path
 
 
 def _spec_path(
-    specs: dict[tuple[str, Optional[str]], str],
+    specs: dict[tuple[str, Optional[str], Optional[str]], str],
     architecture: str,
     model_type: Optional[str],
+    isa: Optional[str],
 ) -> Optional[str]:
-    return specs.get((architecture, model_type)) or specs.get((architecture, None))
+    return (
+        specs.get((architecture, model_type, isa))
+        or specs.get((architecture, None, isa))
+        or specs.get((architecture, model_type, None))
+        or specs.get((architecture, None, None))
+    )
+
+
+def register_builtin_specs() -> None:
+    register(
+        backend=BACKEND,
+        architecture="MuseSparkForConditionalGeneration",
+        isa="gfx1250",
+        path="sglang.srt.kernel_plugins.amd.muse_spark.spec:SPEC",
+    )
 
 
 def spec_registered(
@@ -207,9 +232,11 @@ def spec_registered(
     model_type: Optional[str] = None,
 ) -> bool:
     """Whether the backend registers a spec for any architecture, usable or not."""
+    register_builtin_specs()
     specs = _REGISTRY.get(backend, {})
     return any(
-        _spec_path(specs, arch, model_type) is not None for arch in architectures or ()
+        arch in (architectures or ()) and kind in (model_type, None)
+        for arch, kind, _ in specs
     )
 
 
@@ -221,6 +248,7 @@ def find_spec(
     model_type: Optional[str] = None,
 ) -> tuple[Optional[MonoSpec], str]:
     """The compatible spec and an empty reason, or None and a rejection reason."""
+    register_builtin_specs()
     if backend not in _REGISTRY:
         return None, (
             f"no monokernel backend {backend!r} is registered (registered: "
@@ -228,7 +256,7 @@ def find_spec(
         )
     why = []
     for arch in architectures or ():
-        path = _spec_path(_REGISTRY[backend], arch, model_type)
+        path = _spec_path(_REGISTRY[backend], arch, model_type, isa)
         if path is None:
             continue
         module, _, attr = path.partition(":")

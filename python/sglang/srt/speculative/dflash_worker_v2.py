@@ -27,6 +27,7 @@ from sglang.srt.layers.logits_processor import (
     should_apply_lm_head_quant_method,
 )
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -435,6 +436,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._warned_lilicorr_eager = False
         self._draft_probs_buf = None
         self._full_embed_gpu: Optional[torch.Tensor] = None
+        self._full_embed_norm: Optional[torch.nn.Module] = None
+        self._token_counts: dict[int, torch.Tensor] = {}  # read-only device scalars
         # Under dp attention, peer DP ranks run different (idle) paths, so
         # spec broadcasts must stay within the attn-TP group.
         self._tp_sync = SpecTpSync(get_dp_tp_group())
@@ -1372,28 +1375,32 @@ class DFlashWorkerV2(BaseSpecWorker):
         *,
         req_pool_indices: torch.Tensor,
         prefix_lens: torch.Tensor,
-        draft_prefix_lens: torch.Tensor,
         verify_out_cache_loc_2d: torch.Tensor,
         bs: int,
         block_size: int,
-    ) -> None:
+    ) -> torch.Tensor:
         """Write the draft-local compact req->token rows: the committed suffix
-        window at [0, draft_prefix_len) plus the verify block slots after it."""
-        suffix_start = prefix_lens.to(torch.int64) - draft_prefix_lens.to(torch.int64)
+        window at [0, draft_prefix_len) plus the verify block slots after it.
+        Returns the compact prefix lengths."""
         full_to_swa = self._draft_kv_full_to_swa_mapping()
         if self._use_triton_compact_rebuild:
-            rebuild_compact_draft_req_to_token_func(
+            draft_prefix_lens = rebuild_compact_draft_req_to_token_func(
                 draft_req_to_token=self.draft_model_runner.req_to_token_pool.req_to_token,
                 target_req_to_token=self.model_runner.req_to_token_pool.req_to_token,
                 req_pool_indices=req_pool_indices,
-                suffix_start=suffix_start,
-                draft_prefix_lens=draft_prefix_lens,
+                seq_lens=prefix_lens,
                 verify_out_cache_loc_2d=verify_out_cache_loc_2d,
                 batch_size=bs,
                 block_size=block_size,
+                window=int(self.draft_window_size),
+                page_size=self._draft_compact_page_size,
                 full_to_swa=full_to_swa,
             )
         else:
+            draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
+            suffix_start = prefix_lens.to(torch.int64) - draft_prefix_lens.to(
+                torch.int64
+            )
             suffix_cache_loc = self._gather_req_to_token_segments(
                 req_to_token=self.model_runner.req_to_token_pool.req_to_token,
                 req_pool_indices=req_pool_indices,
@@ -1423,6 +1430,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 verify_out_cache_loc_2d.reshape(-1),
                 bs,
             )
+        return draft_prefix_lens
 
     def _draft_kv_full_to_swa_mapping(self) -> Optional[torch.Tensor]:
         """The target's full->SWA id table when the draft pool's rows are the
@@ -1498,15 +1506,109 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
     def _cache_full_embed_weight(self) -> None:
-        if not get_parallel().attn_dp_enabled:
-            return
         embedding = unwrap_lora_layer(
             _resolve_dflash_embedding_module(
                 self.draft_model, self._target_worker.model_runner.model
             )
         )
+        if not get_parallel().attn_dp_enabled:
+            self._replicate_noise_embed_table(embedding)
+            return
         # Reconstruct on the table's own group before DP ranks can go idle.
         self._full_embed_gpu = gather_draft_embedding(embedding)
+
+    def _noise_embed_table_from_shards(self, inner, vocab: int) -> torch.Tensor:
+        """The full table as the sum of every rank's local shard lookup, exchanged through
+        /dev/shm files. Each row is owned by one rank and is zero on the others, so the sum
+        has the bits of the all-reduced lookup. Runs on every rank at the same point."""
+        import os
+
+        import numpy as np
+        import torch.distributed as dist
+
+        group = inner.tp_group
+        rank, size = group.rank_in_group, group.world_size
+        with torch.no_grad():
+            local = torch.cat(
+                [
+                    inner._embed_local_shard(
+                        torch.arange(
+                            start, min(start + 8192, vocab), device=self.device
+                        )
+                    )
+                    for start in range(0, vocab, 8192)
+                ]
+            ).contiguous()
+        shape, dtype = tuple(local.shape), local.dtype
+        row_bytes = local[0].numel() * local.element_size()
+        stem = f"/dev/shm/muse_noise_embed_{os.getppid()}"
+        path = f"{stem}_{rank}.bin"
+        local.view(torch.uint8).cpu().numpy().tofile(path)
+        dist.barrier(group=group.cpu_group)
+        with torch.no_grad():
+            for peer in range(size):
+                if peer == rank:
+                    continue
+                theirs = np.memmap(
+                    f"{stem}_{peer}.bin", dtype=np.uint8, mode="r"
+                ).reshape(shape[0], row_bytes)
+                for start in range(0, vocab, 16384):
+                    part = torch.from_numpy(
+                        np.ascontiguousarray(theirs[start : start + 16384])
+                    ).to(self.device)
+                    local[start : start + 16384] += part.view(dtype).view(
+                        -1, *shape[1:]
+                    )
+                del theirs
+        dist.barrier(group=group.cpu_group)
+        os.remove(path)
+        return local
+
+    def _replicate_noise_embed_table(self, embedding) -> None:
+        """AMD monokernel under TP: keep the whole vocab-parallel table on every
+        rank, so the per-step noise-embedding lookup needs no all-reduce. Rows come
+        from the module's own lookup, so they are the same bits; a wrapper's norm
+        (``_NormalizedEmbedding``) is applied after the lookup, as before."""
+        import os
+
+        # MUSE_NOISE_EMBED_TABLE: "host" (default) builds the table from the ranks' local
+        # shards through host files, with no collective; "1" builds it with 25 all-reduces
+        # of 8192 x 8192 (RCCL; one of those never completed on h21-18 with the real
+        # checkpoint and a full page cache, MK.98 / MK.106); "check" builds both and
+        # compares; "0" keeps the per-step all-reduce.
+        mode = os.environ.get("MUSE_NOISE_EMBED_TABLE", "host")
+        if mode == "0":
+            return
+        inner = getattr(embedding, "_embedding", embedding)
+        norm = getattr(embedding, "_norm", None)
+        if not (
+            is_hip()
+            and get_exec().kernel.enable_amd_monokernel
+            and isinstance(inner, VocabParallelEmbedding)
+            and inner.tp_size > 1
+            and (inner is embedding or norm is not None)
+        ):
+            return
+        vocab = int(inner.num_embeddings)
+        table = None
+        if mode in ("host", "check"):
+            table = self._noise_embed_table_from_shards(inner, vocab)
+        if mode in ("1", "check"):
+            rows = []
+            with torch.no_grad():
+                for start in range(0, vocab, 8192):
+                    ids = torch.arange(
+                        start, min(start + 8192, vocab), device=self.device
+                    )
+                    rows.append(inner(ids))
+            reduced = torch.cat(rows)
+            if table is not None and not torch.equal(
+                table.view(torch.uint8), reduced.view(torch.uint8)
+            ):
+                raise RuntimeError("noise-embedding table: host build differs")
+            table = reduced
+        self._full_embed_gpu = table
+        self._full_embed_norm = norm
 
     def _resolve_mask_token_id(
         self, *, mask_token: str, mask_token_id: Optional[int] = None
@@ -2273,10 +2375,37 @@ class DFlashWorkerV2(BaseSpecWorker):
                     attn.v_scale,
                 )
 
+        # One launch for every layer's commit where each draft layer is a plain layer
+        # of one pool that has the all-layer writer (ROCm, scale-free FP8).
+        write_all_layers_kv = None
+        if (
+            ctx_cache_loc_2d is not None
+            and commit_lens is not None
+            and ctx_swa_cache_loc is None
+        ):
+            attns = [layer.self_attn.attn for layer in self.draft_model.layers]
+            routes = [
+                token_to_kv_pool.layer_router.layer(attn.layer_id) for attn in attns
+            ]
+            view = routes[0].view
+            write_layers = getattr(view, "set_kv_buffer_prefix_valid_layers", None)
+            if (
+                write_layers is not None
+                and all(route.plain and route.view is view for route in routes)
+                and all(attn.k_scale is None and attn.v_scale is None for attn in attns)
+            ):
+                layer_ids = tuple(attn.layer_id for attn in attns)
+
+                def write_all_layers_kv(cache_k, cache_v) -> bool:
+                    return write_layers(
+                        layer_ids, ctx_cache_loc_2d, commit_lens, cache_k, cache_v
+                    )
+
         self._fused_kv_helper.materialize(
             ctx_hidden=ctx_hidden,
             positions=ctx_positions,
             write_layer_kv=_write_layer_kv,
+            write_all_layers_kv=write_all_layers_kv,
         )
 
     def _update_target_mamba_state_after_verify(
@@ -2328,6 +2457,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                 model=model_runner.model,
                 req_pool_indices=batch.req_pool_indices[: commit_lens.shape[0]],
             )
+
+    def _token_count(self, n: int) -> torch.Tensor:
+        """A device int32 scalar holding ``n``, made once: a draft block's token count
+        is the same every step and nothing writes it."""
+        if n not in self._token_counts:
+            self._token_counts[n] = torch.full(
+                (), n, dtype=torch.int32, device=self.device
+            )
+        return self._token_counts[n]
 
     def _ensure_accept_bonus_buffers(self, bs: int) -> None:
         if self._accept_bonus_buffer_cap >= int(bs):
@@ -2796,6 +2934,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             noise_embedding = torch.nn.functional.embedding(
                 block_ids, self._full_embed_gpu
             )
+            if self._full_embed_norm is not None:
+                noise_embedding = self._full_embed_norm(noise_embedding)
         else:
             noise_embedding = embed_module(block_ids)
         if self._noise_embed_scale != 1.0:
@@ -2821,16 +2961,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
         if self.use_compact_draft_cache:
             # Rebuild the draft-local sliding-window view from committed target state.
-            draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
             self._fill_compact_seq_lens_cpu_bound(
                 batch_seq_lens_cpu=batch.seq_lens_cpu,
                 nxt_kv_lens_cpu=draft_input.nxt_kv_lens_cpu,
                 out=seq_lens_cpu,
             )
-            self._rebuild_compact_draft_cache(
+            draft_prefix_lens = self._rebuild_compact_draft_cache(
                 req_pool_indices=batch.req_pool_indices,
                 prefix_lens=prefix_lens,
-                draft_prefix_lens=draft_prefix_lens,
                 verify_out_cache_loc_2d=verify_out_cache_loc_2d,
                 bs=bs,
                 block_size=block_size,
@@ -2872,7 +3010,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             num_token_non_padded=(
-                torch.full((), bs * block_size, dtype=torch.int32, device=device)
+                self._token_count(bs * block_size)
                 if enable_num_token_non_padded()
                 else None
             ),

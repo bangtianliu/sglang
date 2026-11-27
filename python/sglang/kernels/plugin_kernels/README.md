@@ -31,6 +31,17 @@ srt/kernel_plugins/          # SGLang's integration
 ## How a plugin runs
 
 A library registers its specs through the `sglang.srt.plugins` entry point.
+AMD registrations may also specify `isa="gfx1250"` to coexist with a plugin
+for another device. Lookup tries `(architecture, model_type, isa)`, then
+`(architecture, None, isa)`, `(architecture, model_type, None)`, and finally
+`(architecture, None, None)`. Existing registrations that omit `isa` keep their
+architecture-only fallback behavior; conflicting paths for the same full key
+are refused. This additive registration option keeps monokernel API version 1.
+The registry also installs built-in paths before discovery and lookup, without
+importing model code. Muse Spark on gfx1250 uses the in-tree runtime adapter at
+`sglang.srt.kernel_plugins.amd.muse_spark.spec:SPEC`; an external architecture-only
+gfx950 registration continues to serve gfx950 regardless of registration order.
+
 With its server flag set, `srt/kernel_plugins/<hardware>/binding.py`:
 - checks the spec against the resolved configuration at argument resolution,
   before the weights load, and stops the server listing every reason it cannot

@@ -1,0 +1,252 @@
+{
+  "1": {
+    "positional": [
+      "X",
+      "W",
+      "P",
+      "State",
+      "Partial",
+      "Barriers",
+      "Status",
+      "POS",
+      "COS",
+      "LOC",
+      "MAP",
+      "KC",
+      "VC",
+      "Q",
+      "K",
+      "V",
+      "G",
+      "KS",
+      "VS"
+    ],
+    "constants": [
+      "GRID",
+      "STRIDE",
+      "EPS",
+      "SCALE",
+      "ROPE",
+      "HAS_MAP",
+      "SKIP"
+    ],
+    "runtime": [
+      "Seed",
+      "Trace",
+      "Failure"
+    ],
+    "defaults": {
+      "SKIP": -1,
+      "Seed": null,
+      "Trace": null,
+      "Failure": null
+    }
+  },
+  "2": {
+    "positional": [
+      "Q",
+      "K",
+      "V",
+      "Pages",
+      "Map",
+      "Length",
+      "KS",
+      "VS",
+      "P",
+      "LSE",
+      "Epochs",
+      "Barriers",
+      "Status",
+      "CtaStatus",
+      "Out"
+    ],
+    "constants": [
+      "GRID",
+      "SPLITS",
+      "MAX_PAGES",
+      "SCALE",
+      "LEFT",
+      "HAS_MAP",
+      "MAP_PAGE",
+      "SKIP"
+    ],
+    "runtime": [
+      "Seed",
+      "Failure"
+    ],
+    "defaults": {
+      "SKIP": -1,
+      "Seed": null,
+      "Failure": null
+    }
+  },
+  "3": {
+    "positional": [
+      "X",
+      "Gate",
+      "W",
+      "Stream",
+      "Pre",
+      "Alpha",
+      "Beta",
+      "Normalized",
+      "KPart",
+      "P",
+      "Partial",
+      "Epochs",
+      "Barriers",
+      "Status",
+      "Scratch",
+      "Peers",
+      "Ready",
+      "Reduced",
+      "Out",
+      "Updated"
+    ],
+    "constants": [
+      "GRID",
+      "STRIDE",
+      "RANK",
+      "PAYLOAD",
+      "FLAGS",
+      "SKIP"
+    ],
+    "runtime": [
+      "Seed",
+      "Trace",
+      "Failure"
+    ],
+    "defaults": {
+      "SKIP": -1,
+      "Seed": null,
+      "Trace": null,
+      "Failure": null
+    }
+  },
+  "4": {
+    "positional": [
+      "X",
+      "W",
+      "Bias",
+      "Norm",
+      "KPart",
+      "P",
+      "Epochs",
+      "Barriers",
+      "Status",
+      "Scores",
+      "Ids",
+      "Y",
+      "Sorted",
+      "Experts",
+      "NumPost"
+    ],
+    "constants": [
+      "GRID",
+      "STRIDE",
+      "LOCAL_START",
+      "SKIP"
+    ],
+    "runtime": [
+      "Seed",
+      "Failure"
+    ],
+    "defaults": {
+      "SKIP": -1,
+      "Seed": null,
+      "Failure": null
+    }
+  },
+  "5": {
+    "positional": [
+      "X",
+      "Ids",
+      "Scores",
+      "Sorted",
+      "Experts",
+      "NumPost",
+      "W13",
+      "S13",
+      "W2",
+      "S2",
+      "Gamma",
+      "Inter",
+      "Y",
+      "Scaled",
+      "Inv",
+      "Weighted",
+      "Partial",
+      "Reduced",
+      "Epochs",
+      "Barriers",
+      "Status",
+      "Scratch",
+      "Peers",
+      "Ready"
+    ],
+    "constants": [
+      "GRID",
+      "BAR_STRIDE",
+      "PAYLOAD",
+      "FLAGS",
+      "RANK",
+      "SKIP",
+      "READ_MODE",
+      "W2_SK"
+    ],
+    "runtime": [
+      "Seed",
+      "Trace",
+      "KPartial",
+      "TaskTrace",
+      "Failure",
+      "Out"
+    ],
+    "defaults": {
+      "SKIP": -1,
+      "Seed": null,
+      "Trace": null,
+      "READ_MODE": 0,
+      "W2_SK": 1,
+      "KPartial": null,
+      "TaskTrace": null,
+      "Failure": null,
+      "Out": null
+    }
+  },
+  "6": {
+    "positional": [
+      "X",
+      "W",
+      "Stream",
+      "Post",
+      "Pre",
+      "Alpha",
+      "Beta",
+      "KPart",
+      "P",
+      "Epochs",
+      "Barriers",
+      "Status",
+      "Out",
+      "Updated"
+    ],
+    "constants": [
+      "GRID",
+      "STRIDE",
+      "PRE_BF16",
+      "SKIP"
+    ],
+    "runtime": [
+      "Seed",
+      "Trace",
+      "Failure"
+    ],
+    "defaults": {
+      "SKIP": -1,
+      "Seed": null,
+      "Trace": null,
+      "Failure": null
+    }
+  }
+}

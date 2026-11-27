@@ -59,7 +59,7 @@ from sglang.srt.models.utils import (
     bind_or_assign,
     keeps_no_quant_config,
 )
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
     get_dflash_attention_sliding_window_size,
@@ -128,6 +128,58 @@ def _logical_linear_weight_shape(
     return (logical_numel,)
 
 
+_CHAIN_HEAD_WS = {}  # (device, vocab rows) -> tlx_lm_head.Workspace; must outlive the graphs
+
+
+def _gfx1250_chain_candidate_logits(hidden, weight, num_org: int):
+    """gfx1250 with the AMD monokernel chain: 8 draft rows through the chain's projection
+    kernel (the one the target LM head uses there) instead of torch.matmul, which streams the
+    vocabulary shard several times slower on this GPU. Returns fp32 sums over the whole stored
+    shard with the rows past ``num_org`` masked out of any top-k, or None when it does not
+    apply. MUSE_CHAIN_DRAFT_HEAD=0 turns it off."""
+    import os
+
+    if not (
+        is_hip()
+        and os.environ.get("MUSE_PEER_HOST") == "1"
+        and os.environ.get("MUSE_CHAIN_DRAFT_HEAD", "1") == "1"
+        and get_exec().kernel.enable_amd_monokernel
+    ):
+        return None
+    from sglang.kernels.plugin_kernels.amd.muse_spark.gfx1250.stages import tlx_lm_head
+
+    rows = hidden.shape[0]
+    if hidden.dim() == 2 and 0 < rows < 8 and hidden.dtype == torch.bfloat16:
+        # the kernel takes exactly 8 rows (the draft block has 7): pad with zero rows in a
+        # persistent buffer and return the leading rows of its output
+        pad_key = ("pad", weight.device)
+        padded = _CHAIN_HEAD_WS.get(pad_key)
+        if padded is None:
+            padded = _CHAIN_HEAD_WS[pad_key] = torch.zeros(
+                (8, hidden.shape[1]), device=hidden.device, dtype=hidden.dtype
+            )
+        padded[:rows].copy_(hidden)
+        hidden = padded
+    hidden = hidden.contiguous()
+    if not tlx_lm_head.supported(hidden, weight):
+        if not _CHAIN_HEAD_WS.get("reported"):
+            _CHAIN_HEAD_WS["reported"] = True
+            logger.info(
+                "DFlash candidate projection keeps torch.matmul: hidden %s %s, head %s %s, "
+                "num_org %d",
+                tuple(hidden.shape), hidden.dtype, tuple(weight.shape), weight.dtype, num_org,
+            )
+        return None
+    key = (weight.device, weight.shape[0])
+    ws = _CHAIN_HEAD_WS.get(key)
+    if ws is None:
+        ws = _CHAIN_HEAD_WS[key] = tlx_lm_head.Workspace(weight.device, weight.shape[0])
+    logits = tlx_lm_head.launch(hidden, weight, ws)
+    if logits.shape[-1] > num_org:
+        logits[:, num_org:] = float("-inf")
+    return logits[:rows]
+
+
 def _project_candidate_logits(
     hidden: torch.Tensor, lm_head: nn.Module, *, num_org: int, use_quant_head: bool
 ) -> torch.Tensor:
@@ -135,6 +187,9 @@ def _project_candidate_logits(
     if not use_quant_head:
         weight = lm_head.weight
         hidden = hidden.to(weight.dtype)
+        chain_logits = _gfx1250_chain_candidate_logits(hidden, weight, num_org)
+        if chain_logits is not None:
+            return chain_logits
         # Tuned bf16 dispatch (kernel chosen by GEMM shape); bf16 CUDA only.
         backend = get_bf16_gemm_backend()
         if (

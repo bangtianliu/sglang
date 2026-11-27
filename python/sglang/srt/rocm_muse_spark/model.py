@@ -317,10 +317,17 @@ def _compute_use_rope(config, layer_idx: int) -> bool:
 
 
 def _compute_sliding_window(config, layer_idx: int) -> int | None:
-    """The config states the span; the kernels want the causal offset."""
+    """The span of a sliding layer: its own position and the ``sliding_window - 1`` before it.
+
+    The AITER / tlx backend reads ``sliding_window_size`` as the span and passes the paged
+    attention ``window_size = (size - 1, 0)`` (preceding keys). Handing it ``span - 1`` here
+    made the layer attend 2047 keys, not the config's 2048 (measured: mk/window_probe.py).
+    The tuned verify / extend kernels gated on a 2047 span no longer match and fall back to
+    the generic paged attention.
+    """
     if config.layer_types[layer_idx] != "sliding_attention":
         return None
-    return config.sliding_window - 1
+    return config.sliding_window
 
 
 # One-launch per-head q/k RMSNorm (+ query scale) on ROCm; MUSE_FUSE_QK_NORM=0 restores the eager path.
@@ -1900,8 +1907,9 @@ class MuseSparkTextForCausalLM(nn.Module):
         return self.model.layers
 
     def get_attention_sliding_window_size(self) -> int | None:
+        # What the SWA pool retains: the layers' span (see _compute_sliding_window).
         if "sliding_attention" in self.config.layer_types:
-            return self.config.sliding_window - 1
+            return self.config.sliding_window
         return None
 
     # The release stacks the experts into one tensor per projection and renames the
