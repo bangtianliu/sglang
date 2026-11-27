@@ -13,10 +13,14 @@ import torch
 
 from sglang.srt.kernel_plugins.amd.muse_spark import inputs
 
-FIRST_LAYER, LAST_LAYER = 1, 60  # layers 0 and 61 keep the native layer
-# probe (MK.72): serve only layers FIRST_LAYER..MUSE_CHAIN_LAST_LAYER with the chain, the rest
-# natively, to split the per-step time into a per-layer cost and a fixed cost
-LAST_LAYER = min(LAST_LAYER, int(os.environ.get("MUSE_CHAIN_LAST_LAYER", LAST_LAYER)))
+MODEL_LAST_LAYER = 61
+# Chain layers FIRST_LAYER..LAST_LAYER; the rest run natively. The default 1..60 keeps the two
+# BF16-expert layers (0, 61) native; MUSE_CHAIN_FIRST_LAYER=0 / MUSE_CHAIN_LAST_LAYER=61 chain
+# them (each separately, to bisect). A lower LAST is the MK.72 probe (per-layer vs fixed cost).
+FIRST_LAYER = int(os.environ.get("MUSE_CHAIN_FIRST_LAYER", "0"))
+LAST_LAYER = int(os.environ.get("MUSE_CHAIN_LAST_LAYER", "61"))
+if not 0 <= FIRST_LAYER <= LAST_LAYER <= MODEL_LAST_LAYER:
+    raise ValueError(f"chain layers {FIRST_LAYER}..{LAST_LAYER}: need 0 <= first <= last <= 61")
 # probe (MK.77): MUSE_LAYER_STAMPS="29,30": per-kernel realtime stamps inside those layers
 LAYER_STAMPS = {int(v) for v in os.environ.get("MUSE_LAYER_STAMPS", "").split(",") if v}
 _KERNEL_STAMPS = {}
@@ -109,6 +113,7 @@ class ChainRuntime:
         self._metadata = step_metadata
         self._copies = copies
         self._weights = {i: layer_weights(i) for i in range(FIRST_LAYER, LAST_LAYER + 1)}
+        self._bf16 = {i for i, w in self._weights.items() if w["w13"].dtype == torch.bfloat16}
         self._two_copies, self._route = {}, None  # layer -> placement masks
         if EXPERT_COPIES == 2:
             from sglang.kernels.plugin_kernels.amd.muse_spark.gfx1250.stages import tlx_route
@@ -123,6 +128,8 @@ class ChainRuntime:
                 with open(COPY_FREQ) as f:
                     freq = json.load(f)["freq"]
             for i in range(FIRST_LAYER, min(LAST_LAYER, COPY_LAST_LAYER) + 1):
+                if i in self._bf16:  # a second BF16 copy is 6 GiB per rank
+                    continue
                 self._two_copies[i] = (tlx_route.repl_masks_full() if freq is None
                                        else placement.place(freq[i], COPY_BUDGET))
             # every layer's expert tensors get the same length on this rank (see
@@ -245,6 +252,11 @@ class ChainRuntime:
     def _kind(self, i: int) -> str:
         return "full" if i % 4 == 1 else "sliding"
 
+    def variant(self, i: int) -> tuple:
+        """The compiled-kernel set layer ``i`` launches. Booleans only, so the key names a
+        variant and never one layer: a per-layer value would compile per layer at start-up."""
+        return (self._kind(i), i in self._two_copies, i in self._bf16, i == MODEL_LAST_LAYER)
+
     def begin_step(self, forward_batch=None, rows: int = ROWS):
         """Call once per forward, before layer FIRST_LAYER (also during graph capture).
 
@@ -315,9 +327,10 @@ class ChainRuntime:
             return None
         kind = self._kind(i)
         self._set_copies(i)
-        ckey = (kind, i in self._two_copies)  # each kernel variant compiles on every rank first
+        last = i == MODEL_LAST_LAYER
+        ckey = self.variant(i)  # each kernel variant compiles on every rank first
         if ckey not in self._compiled and not torch.cuda.is_current_stream_capturing():
-            self._compile(kind, i, positions, stream, forward_batch, attn_input, meta)
+            self._compile(kind, i, positions, stream, forward_batch, attn_input, meta, last)
             self._compiled.add(ckey)
         ws = self._workspaces[kind, self._turn[kind]]
         self._turn[kind] = (self._turn[kind] + 1) % self._copies
@@ -328,11 +341,12 @@ class ChainRuntime:
                 _KERNEL_STAMPS[i] = tlx_stamp.KernelStamps(stream.device, f"layer{i}-{kind}")
             with _KERNEL_STAMPS[i].layer():
                 out, new_stream = self._chain.launch(
-                    attn_input, stream, self._weights[i], meta, ws, rank=self.rank
+                    attn_input, stream, self._weights[i], meta, ws, rank=self.rank,
+                    pre_bf16=last,
                 )
             return new_stream, out, None
         out, new_stream = self._chain.launch(
-            attn_input, stream, self._weights[i], meta, ws, rank=self.rank
+            attn_input, stream, self._weights[i], meta, ws, rank=self.rank, pre_bf16=last
         )
         if COPY_CHECK and i in self._two_copies and not torch.cuda.is_current_stream_capturing():
             self._check_copies(i, ws)
@@ -341,7 +355,7 @@ class ChainRuntime:
             self._route_counts[i].index_add_(0, ws.s4.ids.view(-1).long(), self._route_ones)
         return new_stream, out, None
 
-    def _compile(self, kind, i, positions, stream, forward_batch, attn_input, meta):
+    def _compile(self, kind, i, positions, stream, forward_batch, attn_input, meta, last):
         """Compile this kind's kernels on every rank before its first executed launch.
 
         Ranks compile at different speeds (seconds), and an exchange that one rank starts while
@@ -356,7 +370,7 @@ class ChainRuntime:
             for ws in copies:  # every workspace copy, in case a copy compiles its own launch
                 # the real operands: a compiled binary is keyed on each tensor's alignment
                 self._chain.launch(attn_input, stream, self._weights[i], meta, ws,
-                                   rank=self.rank)
+                                   rank=self.rank, pre_bf16=last)
         torch.cuda.synchronize()
         del graph
         self._barrier()

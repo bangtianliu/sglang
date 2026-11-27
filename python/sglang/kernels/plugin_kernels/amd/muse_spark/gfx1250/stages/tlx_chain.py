@@ -110,7 +110,9 @@ S6_DEPTH = None
 S6_DEPTHS = {(8192, -1): 3, (8192, 2047): 3, (131072, -1): 3, (131072, 2047): 3}
 
 
-def launch(x, stream, w, m, ws, *, rank, skip_stage=-1, seed=None, guard_mode=0):
+def launch(x, stream, w, m, ws, *, rank, skip_stage=-1, seed=None, guard_mode=0, pre_bf16=False):
+    """``pre_bf16``: the model's last layer, whose FFN boundary rounds the new stream to bf16
+    before the final norm (the native last layer does the same)."""
     assert 0 <= rank < 4
     assert guard_mode == 0
     pos, cos, loc, mapping, kc, vc, ks, vs, pages, length = m
@@ -193,8 +195,10 @@ def launch(x, stream, w, m, ws, *, rank, skip_stage=-1, seed=None, guard_mode=0)
         rank=rank,
         workspace=ws.s4,
         fused=FUSE_ROWS_SLOTS,
+        # the MXFP8 pooled rows feed only the MXFP4 W13; BF16-expert layers read the bf16 rows
         mx=((lambda m: (m["xq"], m["xs"]) + ((m["xq2"], m["xs2"]) if tlx_experts.SPLIT13 else ()))
-            (tlx_experts.mx_buffers(b["x4"].device)) if tlx_experts.MX13 else None),
+            (tlx_experts.mx_buffers(b["x4"].device))
+            if tlx_experts.MX13 and w["w13"].dtype != torch.bfloat16 else None),
         **opts(4),
     )
     experts = tlx_experts
@@ -223,6 +227,7 @@ def launch(x, stream, w, m, ws, *, rank, skip_stage=-1, seed=None, guard_mode=0)
         packed_handoff=True,
         projection_depth=S6_DEPTH or S6_DEPTHS.get((ws.context, ws.left), 4),
         output=(b["out"], b["stream"]),
+        pre_bf16=pre_bf16,
         **opts(6),
     )
     return (b["out"], b["stream"])

@@ -32,16 +32,25 @@ _EXPECT = {
     "alpha6": ((HIDDEN,), torch.float32),
     "beta6": ((HIDDEN,), torch.float32),
 }
+# Quark keeps the routed experts of the first and last MoE layer in BF16 (no scales).
+BF16_EXPERT_LAYERS = (0, 61)
+_EXPECT_BF16 = {
+    **{k: v for k, v in _EXPECT.items() if not k.startswith(("w13", "w2"))},
+    "w13": ((LOCAL_EXPERTS, 2 * INTER, POOLED), torch.bfloat16),
+    "w2": ((LOCAL_EXPERTS, POOLED, INTER), torch.bfloat16),
+}
 
 
 def layer_weights(backbone, i: int) -> dict:
-    """The chain's ``w`` of layer ``i`` (1 .. 60) on this rank.
+    """The chain's ``w`` of layer ``i`` (0 .. 61) on this rank; layers 0 and 61 carry BF16
+    experts and no ``w13_scale`` / ``w2_scale``.
 
     ``backbone`` is the loaded ``MuseSpark1xModel`` after ``post_load_weights`` (the fused
     boundaries hold their cached gains and gate coefficients).
     """
-    if not 1 <= i <= 60:
-        raise ValueError(f"layer {i}: the chain serves layers 1..60 (MXFP4 experts)")
+    if not 0 <= i <= 61:
+        raise ValueError(f"layer {i}: the model has MoE layers 0..61")
+    bf16 = i in BF16_EXPERT_LAYERS
     layer, boundary = backbone.layers[i], backbone._ffn_boundaries[i]
     attn, moe, mid = layer.self_attn, layer.mlp, layer._fused_attn_boundary
     mid._ensure_cached_weights(torch.bfloat16)
@@ -56,9 +65,7 @@ def layer_weights(backbone, i: int) -> dict:
         bias=moe.expert_bias,
         route_norm=moe.pre_expert_norm._get_effective_weight(),
         w13=moe.experts.w13_weight,
-        w13_scale=moe.experts.w13_weight_scale,
         w2=moe.experts.w2_weight,
-        w2_scale=moe.experts.w2_weight_scale,
         # the raw zero-centred gain: the kernel adds 1.0 itself
         gamma5=moe.post_expert_norm.weight,
         unpooler=moe.post_expert_proj.weight,
@@ -67,8 +74,10 @@ def layer_weights(backbone, i: int) -> dict:
         alpha6=boundary._cc_alpha,
         beta6=boundary._cc_beta,
     )
+    if not bf16:
+        w.update(w13_scale=moe.experts.w13_weight_scale, w2_scale=moe.experts.w2_weight_scale)
     errors = []
-    for name, (shape, dtype) in _EXPECT.items():
+    for name, (shape, dtype) in (_EXPECT_BF16 if bf16 else _EXPECT).items():
         t = w[name]
         if not isinstance(t, torch.Tensor):
             errors.append(f"{name}: missing")

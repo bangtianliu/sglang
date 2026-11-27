@@ -78,6 +78,9 @@ def tlx_s5(x, tab, w13, w2, inter, out, k_step, depth, grid, wpe):
 
 
 def native_s5(x, tab, w13, w2, inter, out):
+    # _launch_gemm's N is the output width (after SwiGLU for W13), not the weight rows
+    assert inter.shape == out.shape == (T * TOPK, H), (inter.shape, out.shape)
+    assert w13.shape == (LOCAL, 2 * H, H) and w2.shape == (LOCAL, H, H), (w13.shape, w2.shape)
     sorted_ids, experts, num_post = tab
     cfg = native._pick_config(T, TOPK, LOCAL, False)
     native._launch_gemm(x, w13, None, inter, sorted_ids, experts, num_post,

@@ -102,7 +102,7 @@ class CompareForward(Stage0Forward):
 
     def _chain_once(self, i, positions, stream, forward_batch, attn_input):
         chain = self._chain
-        kind = chain._kind(i)
+        kind = chain.variant(i)
         if kind not in self._compiled:
             # Compile on every rank inside a throwaway capture (nothing executes): ranks compile
             # at different speeds, and an exchange started meanwhile would time out (~1 ms).

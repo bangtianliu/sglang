@@ -78,6 +78,11 @@ FUSE13_2 = False
 # launch is persistent: CTA pid runs tasks pid, pid + grid, ...
 EXPERT_GRID = None
 FUSED_GRID = 576
+# BF16-expert layers (0, 61): tile K step, LDS depth and waves per EU of both phases
+# (h13-16 sweep, notes/h13-16-layers-0-61.md: K256 / depth 2 / 2 per EU is best at E = 2..16)
+BF16_K_STEP = 256
+BF16_DEPTH = 2
+BF16_WPE = 2
 
 
 def expert_launch_grid(device):
@@ -596,13 +601,14 @@ def s5(
         enable_fp_fusion=False,
         SCALE_ASYNC=ws.scale_async,
     )
+    wbf16 = weights["w13"].dtype == torch.bfloat16
     a1 = (
         x,
         sorted_ids,
         experts,
         num_post,
         weights["w13"],
-        weights["w13_scale"],
+        weights["w13"] if wbf16 else weights["w13_scale"],
         ws.inter[rank],
         s.status,
         failure,
@@ -613,7 +619,7 @@ def s5(
         experts,
         num_post,
         weights["w2"],
-        weights["w2_scale"],
+        weights["w2"] if wbf16 else weights["w2_scale"],
         ws.output[rank],
         s.status,
         failure,
@@ -651,11 +657,19 @@ def s5(
         k2.update(WIDE=True, SCALE_ASYNC=True, waves_per_eu=WPE2, EARLY=EARLY_ISSUE, DEPTH=DEPTH2)
         if MX2 or FOLD2:
             k2.update(MX=True, XS=mx["is"][rank], FOLD=bool(FOLD2))
-    if MX13:
-        a1 = (mx["xq"],) + a1[1:]
-    if MX2 or FOLD2:
-        a1 = a1[:6] + (mx["iq"][rank],) + a1[7:]
-        a2 = (mx["iq"][rank],) + a2[1:]
+    if wbf16:
+        # bf16 pooled rows against bf16 weights: none of the MXFP8 activation paths apply
+        assert not (FUSE13_2 or FOLD2 or MX2) and weight_cache == ""
+        bf = {**common, "WBF16": True, "K_STEP": BF16_K_STEP, "DEPTH": BF16_DEPTH,
+              "waves_per_eu": BF16_WPE, "Seed": delay_seed}
+        k1 = dict(bf, FIRST=True, SKIP=skip)
+        k2 = dict(bf, FIRST=False, CROSS_LAUNCH_A=True)
+    else:
+        if MX13:
+            a1 = (mx["xq"],) + a1[1:]
+        if MX2 or FOLD2:
+            a1 = a1[:6] + (mx["iq"][rank],) + a1[7:]
+            a2 = (mx["iq"][rank],) + a2[1:]
     an = (ws.output, gamma, ids, ws.scaled, ws.inv, s.status, failure)
     kn = dict(RANK=rank, Seed=delay_seed, num_warps=4, enable_fp_fusion=False)
     ar = (
@@ -698,6 +712,8 @@ def s5(
         ws.wide_w13,
         ws.wide_w2,
     )
+    if wbf16:
+        key = key + ("wbf16", BF16_K_STEP, BF16_DEPTH, BF16_WPE)
     from sglang.kernels.plugin_kernels.amd.muse_spark.gfx1250.stages import tlx_route
 
     if tlx_route.REPL:

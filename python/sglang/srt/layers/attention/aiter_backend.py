@@ -884,6 +884,15 @@ class AiterAttnBackend(AttentionBackend):
         # (each behind its own SGLANG_ROCM_MUSE_* switch); decode is unchanged.
         # Muse Spark's attention shapes (GQA 8, head_dim 64, sliding window); other models with the
         # same shapes (gpt-oss) keep the generic paths.
+        # Muse Spark on other ROCm targets (gfx1250): the unified verify still reads only
+        # the block page table (its metadata carries no token-level index), so the
+        # token-level build is skipped there too. The other Muse fast paths stay gfx95-only.
+        self.muse_unified_verify_page_table_only = (
+            getattr(model_runner.model_config.hf_config, "model_type", None)
+            in ("muse_spark", "muse_spark_text")
+            and self._use_unified_verify
+            and self.use_sliding_window_kv_pool
+        )
         self.use_muse_attention_paths = (
             is_gfx95_supported()
             and getattr(model_runner.model_config.hf_config, "model_type", None)
@@ -3927,7 +3936,9 @@ class AiterAttnBackend(AttentionBackend):
                 )
             else:
                 kv_lens = seq_lens
-            if self.use_muse_attention_paths and self._use_unified_verify:
+            if (
+                self.use_muse_attention_paths or self.muse_unified_verify_page_table_only
+            ) and self._use_unified_verify:
                 # Unified verify reads the block page table only; the token-level
                 # KV index build (cumsum + index kernel over the whole context)
                 # would be wasted replay preparation.
