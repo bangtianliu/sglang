@@ -155,8 +155,13 @@ def _build(model, hf_config, ctx):
             # the rank processes share a parent: one name per server
             name=f"muse_spark_{os.getppid()}",
         )
-    if chain is not None and os.environ.get("MUSE_HOST_ALL_REDUCE") == "1":
-        # experiment (MK.110): the [8, 8192] and [8, 4096] bf16 all-reduces of a decode step
+    if (
+        chain is not None
+        and os.environ.get("MUSE_HOST_ALL_REDUCE", "1") == "1"
+        and os.environ.get("MUSE_PEER_HOST") == "1"
+        and group.world_size == 4
+    ):
+        # On by default (user's decision 2026-11-26, for stability; MK.110): the [8, 8192] and [8, 4096] bf16 all-reduces of a decode step
         # outside the chain layers (layers 0 and 61, the input embedding) go through the
         # chain's host-memory exchange instead of the communication library. Other shapes
         # (prefill) are unchanged. Sums are rounded once, not pairwise.

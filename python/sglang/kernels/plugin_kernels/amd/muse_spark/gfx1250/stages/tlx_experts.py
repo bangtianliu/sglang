@@ -30,6 +30,9 @@ from sglang.kernels.plugin_kernels.amd.muse_spark.gfx1250.stages.tlx_expert_core
 from sglang.kernels.plugin_kernels.amd.muse_spark.gfx1250.stages.tlx_expert_wide import (
     expert_tile_wide,
 )
+from sglang.kernels.plugin_kernels.amd.muse_spark.gfx1250.stages.tlx_expert_bf16 import (
+    expert_tile_bf16,
+)
 
 _make_common_workspace = tlx_workspace.make_s5
 
@@ -229,6 +232,9 @@ def expert_phase(
     XS2=None,
     Publish=None,
     FOLD: tl.constexpr = False,
+    # bf16 [N, 4096] weights with no scales (layers 0 and 61); Scale is unused
+    WBF16: tl.constexpr = False,
+    K_STEP: tl.constexpr = 256,
 ):
     pid = tl.program_id(0)
     TRACE: tl.constexpr = Trace is not None
@@ -257,7 +263,22 @@ def expert_phase(
             else:
                 expert = tl.load(Experts + block)
                 pre = None
-            if WIDE:
+            if WBF16:
+                expert_tile_bf16(
+                    X,
+                    Sorted,
+                    W,
+                    Out,
+                    block,
+                    expert,
+                    task % 64,
+                    FIRST,
+                    CROSS_LAUNCH_A,
+                    DEPTH=DEPTH,
+                    K_STEP=K_STEP,
+                    SLOTS=pre,
+                )
+            elif WIDE:
                 expert_tile_wide(
                     X,
                     Sorted,
