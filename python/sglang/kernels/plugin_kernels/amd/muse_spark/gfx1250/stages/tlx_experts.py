@@ -3,6 +3,7 @@
 No activation quantization, store pins, physical peers or unbounded waits.
 """
 
+import os
 import msgspec
 import torch
 import triton
@@ -40,7 +41,7 @@ _make_common_workspace = tlx_workspace.make_s5
 # Expert phases read their first task's slot table with the failure word.
 EARLY_ISSUE = False
 # K512 banks in flight per wide expert task (W13 / W2).
-DEPTH13 = 2
+DEPTH13 = int(os.environ.get("MUSE_DEPTH13", "2"))  # env: MK.132 placement / pipeline probe
 DEPTH2 = 2
 # probe: int64 [64] buffer for sum_reduce phase stamps (mk/trace_sum.py)
 SUM_TRACE = None
@@ -53,7 +54,7 @@ HOST_SPLIT = 2
 # sum_reduce (fused-norm path) issues every route's loads before the failure read
 EARLY_SUM = True
 # waves per EU for the wide W13 / W2 phases
-WPE13 = 3
+WPE13 = int(os.environ.get("MUSE_WPE13", "3"))  # env: MK.132 placement probe
 # MXFP8 activations x MXFP4 weights on the scaled WMMA (new numerics, user-approved 2026-11-19).
 # Default since MK.66 (2026-11-20): MX13 + SPLIT13 + FOLD13 = W13 reads its bf16 input as two
 # exact fp8 terms folded into one WMMA (same error vs FP64 as the bf16 path, -5 to -7% per layer

@@ -169,7 +169,98 @@ class WatchForward(Stage0Forward):
         self._rank = rank
         self._step = 0
 
+    # MK.128: MUSE_CHAIN_FP=1 also logs a fingerprint of the residual stream after every layer
+    # (float64 sum and abs-sum, as hex), to find the first (step, layer) where two runs differ.
+    _FP = os.environ.get("MUSE_CHAIN_FP") == "1"
+
+    def _run_layer(self, *, i, positions, stream, forward_batch, attn_input, attn_input_fp8):
+        out = super()._run_layer(i=i, positions=positions, stream=stream, forward_batch=forward_batch,
+                                 attn_input=attn_input, attn_input_fp8=attn_input_fp8)
+        if self._FP:
+            torch.cuda.synchronize()
+            d = out[0].double()
+            self._fp.append("%s/%s" % (float(d.sum()).hex(), float(d.abs().sum()).hex()))
+            if self._step == 0 and i in (0, 1, 2):
+                # per-stage fingerprints of the layer's intermediate buffers (byte sums), to name
+                # the first stage whose result differs between two runs
+                try:
+                    ch = self._chain
+                    kind = ch._kind(i)
+                    ws = ch._workspaces[kind, (ch._turn[kind] - 1) % ch._copies]
+                    f = lambda x: int(x.contiguous().view(-1).view(torch.uint8).to(torch.int64).sum())  # noqa: E731
+                    st = {k: f(v) for k, v in ws.buffers.items() if torch.is_tensor(v)}
+                    for name in ("ids", "scores", "pooled", "sorted_ids", "expert_ids", "num_post"):
+                        v = getattr(ws.s4, name, None)
+                        if torch.is_tensor(v):
+                            st["s4." + name] = f(v)
+                    st["s3.normalized"] = f(ws.s3.normalized) if torch.is_tensor(getattr(ws.s3, "normalized", None)) else None
+                    # expert stage: its per-rank intermediates and the MXFP8 activation buffers
+                    import msgspec
+
+                    for name in msgspec.structs.fields(ws.s5):
+                        v = getattr(ws.s5, name.name, None)
+                        if torch.is_tensor(v) and v.numel() < (1 << 28):
+                            st["s5." + name.name] = f(v)
+                    try:
+                        from sglang.kernels.plugin_kernels.amd.muse_spark.gfx1250.stages import tlx_experts
+
+                        for k2, v in tlx_experts.mx_buffers(out[0].device).items():
+                            if torch.is_tensor(v):
+                                st["mx." + k2] = f(v)
+                    except Exception as e2:  # noqa: BLE001
+                        st["mx"] = repr(e2)[:120]
+                    print(json.dumps(dict(event="chain_fp_stage", rank=self._rank, layer=i, kind=str(kind), st=st)),
+                          flush=True)
+                    if i == 1 and os.environ.get("MUSE_CHAIN_FP_DUMP"):
+                        # the expert stage's tensors of this layer and step, for an offline diff
+                        dump = {"s5." + n.name: getattr(ws.s5, n.name).detach().cpu()
+                                for n in msgspec.structs.fields(ws.s5)
+                                if torch.is_tensor(getattr(ws.s5, n.name, None))}
+                        for name in ("ids", "scores", "pooled", "sorted_ids", "expert_ids", "num_post"):
+                            v = getattr(ws.s4, name, None)
+                            if torch.is_tensor(v):
+                                dump["s4." + name] = v.detach().cpu()
+                        dump["x6"] = ws.buffers["x6"].detach().cpu()
+                        torch.save(dump, "%s-r%d.pt" % (os.environ["MUSE_CHAIN_FP_DUMP"], self._rank))
+                except Exception as e:  # noqa: BLE001
+                    print(json.dumps(dict(event="chain_fp_stage", rank=self._rank, layer=i, error=repr(e)[:300])),
+                          flush=True)
+        return out
+
     def _forward_layers(self, *, positions, forward_batch, input_embeds):
+        self._fp = []
+        if self._FP:
+            d = input_embeds.double()
+            self._fp.append("%s/%s" % (float(d.sum()).hex(), float(d.abs().sum()).hex()))
+            if self._step == 0:
+                # fingerprint of the KV prefix that PREFILL wrote, for the first layers: tells a
+                # difference that entered through the (native) prefill from one made by the chain
+                try:
+                    from sglang.srt.rocm_muse_spark import attention_kv_write as kv
+
+                    out = {}
+                    n = int(forward_batch.seq_lens[0])
+                    pages = kv.get_attn_backend().forward_metadata.kv_indices[0].long()
+                    slots = (pages[: (n + 15) // 16, None] * 16
+                             + torch.arange(16, device=pages.device)[None, :]).flatten()[:n]
+                    for i in (0, 1, 2, 3, 30):
+                        t = kv._kv_write_target(self._backbone.layers[i].self_attn, forward_batch)
+                        if t is None:
+                            out[i] = "skipped"
+                            continue
+                        sl = slots
+                        if t.swa_mapping is not None:  # sliding layer: mapped (in-window) slots only
+                            sl = t.swa_mapping[slots].long()
+                            sl = sl[sl > 0]
+                        k = t.k_cache[sl]
+                        v = t.v_cache[sl]
+                        f = lambda x: int(x.contiguous().view(-1).view(torch.uint8).to(torch.int64).sum())  # noqa: E731
+                        out[i] = [int(sl.numel()), f(k), f(v)]
+                    print(json.dumps(dict(event="chain_fp_kv", rank=self._rank, prefix=n, kv=out)),
+                          flush=True)
+                except Exception as e:  # noqa: BLE001
+                    print(json.dumps(dict(event="chain_fp_kv", rank=self._rank, error=repr(e)[:300])),
+                          flush=True)
         out = super()._forward_layers(
             positions=positions, forward_batch=forward_batch, input_embeds=input_embeds
         )
@@ -177,4 +268,7 @@ class WatchForward(Stage0Forward):
         torch.cuda.synchronize()
         print(json.dumps(dict(event="chain_watch", rank=self._rank, step=self._step,
                               failures=self._chain.failures())), flush=True)
+        if self._FP:
+            print(json.dumps(dict(event="chain_fp", rank=self._rank, step=self._step,
+                                  rows=int(positions.shape[0]), fp=self._fp)), flush=True)
         return out
